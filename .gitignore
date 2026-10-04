@@ -1,0 +1,27 @@
+# 忽略实验运行时产物（这些是压测过程中生成的中间文件）
+checkpoint.json
+*.log
+nohup.out
+GO
+STOP
+
+# 分析器输出（可由 results.ndjson + analyze.mjs 重新生成）
+ANALYSIS.md
+arm-summary.csv
+block-series.csv
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 凭证（切勿提交）
+*.key
+*credentials*
+*token*.txt
+nodes.csv
