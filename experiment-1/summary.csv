@@ -1,0 +1,7 @@
+account,model,arm,attempts,ok,a429,b429,other,firstWallIndex
+sensenova-1,kimi-k3,small,12,12,0,0,0,
+sensenova-1,deepseek-v4-flash,small,400,390,0,10,0,
+sensenova-1,deepseek-flash,large,250,48,0,202,0,
+sensenova-2,kimi-k3,small,12,3,0,9,0,
+sensenova-2,deepseek-v4-flash,large,250,192,0,58,0,
+sensenova-2,deepseek-flash,small,39,6,0,33,0,
