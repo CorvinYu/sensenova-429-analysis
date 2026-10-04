@@ -232,4 +232,4 @@ node analyze.mjs
 
 ---
 
-*如有疑问或发现错误，欢迎在本仓库 [Issues](https://github.com/CorvinYu/sensenova-429-study/issues) 中讨论。*
+*如有疑问或发现错误，欢迎在本仓库 [Issues](https://github.com/CorvinYu/sensenova-429-analysis/issues) 中讨论。*
