@@ -1,0 +1,24 @@
+{
+  "base_url": "https://token.sensenova.cn/v1",
+  "max_tokens": 16,
+  "request_timeout_ms": 120000,
+  "global_deadline_hours": 7,
+  "reset_epoch_offset_min": 2,
+  "network_backoff_ms": 3000,
+  "b429_backoff_min_ms": 15000,
+  "b429_backoff_max_ms": 90000,
+  "observe_interval_ms": 300000,
+  "large_target_tokens": 20000,
+  "tasks": [
+    { "id": "a1-k3-small",  "account": "sensenova-1", "model": "kimi-k3",           "arm": "small", "interval_ms": 6000,  "max_attempts": 12 },
+    { "id": "a1-v4f-small", "account": "sensenova-1", "model": "deepseek-v4-flash", "arm": "small", "interval_ms": 10000, "max_attempts": 400 },
+    { "id": "a1-df-large",  "account": "sensenova-1", "model": "deepseek-flash",    "arm": "large", "interval_ms": 30000, "max_attempts": 250 },
+    { "id": "a2-k3-small",  "account": "sensenova-2", "model": "kimi-k3",           "arm": "small", "interval_ms": 6000,  "max_attempts": 12 },
+    { "id": "a2-v4f-large", "account": "sensenova-2", "model": "deepseek-v4-flash", "arm": "large", "interval_ms": 30000, "max_attempts": 250 },
+    { "id": "a2-df-small",  "account": "sensenova-2", "model": "deepseek-flash",    "arm": "small", "interval_ms": 10000, "max_attempts": 400 }
+  ],
+  "prompts": {
+    "small": "请只回答两个字：好的。",
+    "large_seed": "这是一段用于限流压测的重复文本。商汤大装置平台的令牌计划按模型与账号计量，输入令牌数会影响触发阈值。本段落将被重复拼接以构造大输入，内容本身无业务含义。"
+  }
+}
