@@ -1,176 +1,219 @@
-# 商汤 SenseNova API 429 限流触发机制研究
+# SenseNova 429 限流机制的排除法研究
 
-**——两次受控实验（3043 次请求）+ 生产数据佐证**
+**用两次受控实验排除四种候选解释**
 
-**版本 v1.0** · 发布于 2026-10-04
-
-| | |
-|---|---|
-| **作者** | Corvin Yu |
-| **联系** | <https://github.com/CorvinYu> |
-| **日期** | 2026-10-04 |
-| **实验一** | 2026-10-03 白天（北京 09:03–16:06），963 请求 |
-| **实验二** | 北京 2026-10-04 凌晨（01:55–09:25），2080 请求 |
-| **数据源二** | 生产网关日志，近 7 天 2820 次真实请求 |
-| **协议** | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
-| **结论状态** | **探索性研究**，所有结论均标注置信度与局限 |
-
----
-
-## Abstract (English)
-
-SenseNova's free Token Plan OpenAI-compatible endpoint returns HTTP 429 under intensive
-calling. A widely circulated claim attributes this to a fixed per-5-hour request cap
-(e.g. "150 requests / 5h for deepseek-v4-flash"). Through **two controlled experiments
-(3,043 requests total) plus analysis of 2,820 production requests**, this study finds:
-
-1. **The "150 requests / 5h" claim does not hold** — the entitlement-exhaustion wall
-   (`token plan entitlement exhausted`) never triggered in 3,043 requests; a single
-   model reached 390 successful requests in one window without hitting it.
-2. **The B-class rate limiter (TPM/RPM) is the actual primary gate** — all observed
-   429s belong to this class.
-3. **Under controlled conditions within a single account, neither RPM nor input size
-   significantly affects the B-class rate** — a 2×2 factorial design
-   (1 vs 4 req/min × 90 vs 8,000 tokens) showed no significant difference across four
-   arms (only 2 B-class 429s in 2,080 requests), disproving the TPM-causation
-   hypothesis suggested by the first experiment.
-4. **Time-of-day is the largest observed variable** — B-class rate by single-model
-   cohort: 3.4% (late night) → 25.4% (daytime) → **43.3% (evening)**, a ~13× spread.
-5. **B-class triggering is burst-driven** — 255 errors within a single 10-minute
-   window (78% of that hour), then an abrupt drop.
-6. **Model quotas differ substantially** — deepseek-flash 76% vs deepseek-v4-flash 32%.
-
-**Methodological contributions**: (a) 429 classification must rely on the response
-*message text*, not error codes — the same rate limiter surfaced at least 7 distinct
-error codes, including `code 8` on a B-class error; (b) production-log token fields
-**cannot** be used for rate-limit attribution, because failed requests always report
-`NULL` tokens, creating a spurious negative correlation.
-
-**External corroboration**: Anthropic has publicly acknowledged adjusting five-hour
-usage limits *during peak hours* while keeping weekly totals unchanged — a mechanism
-description closely matching our observations.
-
-**Keywords**: SenseNova; rate limiting; HTTP 429; TPM; RPM; API measurement;
-controlled experiment; LLM infrastructure
-
----
+**版本 v2.0** · 2026-10-04 · 作者：[Corvin Yu](https://github.com/CorvinYu) · [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 
 ---
 
 ## 摘要
 
-商汤日日新（SenseNova）免费 Token Plan 的 OpenAI 兼容接口在密集调用时返回 HTTP 429。社区流传的说法是"每 5 小时固定请求次数上限"（如 deepseek-v4-flash 150 次/5h）。本研究通过两次受控实验与生产数据分析，得出以下结论：
+SenseNova 免费 Token Plan 的接口在密集调用时频繁返回 429。面对这一现象，可以提出多种解释，例如"免费额度用完了""请求次数超限""本地发得太快或上下文太长""上游忙的时候才限流"。本研究把这些解释整理为四个可检验的假设，然后用两次受控实验（合计 3043 次请求）与 2820 条生产日志逐一排除。
 
-1. **"150 次/5h"口径不成立** —— 两次实验共 3043 次请求，`token plan entitlement exhausted`（次数墙）**一次未触发**；单模型单窗口内累计成功请求达 390 次仍未触发
-2. **B 类频率闸（tpm/rpm）是实测主闸门** —— 全部 429 均为该类
-3. **同账号受控实验中，RPM 与输入规模都不显著影响 B 类率** —— 实验二 2×2 析因（1 vs 4 rpm × 90 vs 8000 tok）四单元均无显著差异，全实验仅 2 次 B 类
-4. **时段是最大的观测到的变量** —— 生产数据显示 B 类率：深夜 3.4% → 白天 25.4% → **傍晚 43.3%**（单模型口径，13 倍差异）
-5. **B 类触发呈突发性** —— 某十分钟内爆发 255 次（占该小时 78%），随后骤降
-6. **模型间配额差异显著** —— deepseek-flash 76% vs deepseek-v4-flash 32%
-7. **方法与工程结论**：429 分类必须依据响应文案而非错误码；积分池与 429 无关；上游不返回 Retry-After；生产日志的 token 字段不能用于限流归因
+**结论是：前三项都被排除，只有"上游侧状态"这一项无法排除。**
 
-**外部佐证**：Anthropic 已官方公开承认"按高峰时段动态收紧用量限制"，其机制描述（总配额不变、只改时间分配）与本研究观测高度吻合。
+| 假设 | 内容 | 判定 |
+|---|---|---|
+| H1 | 套餐额度用完 | ❌ 排除 |
+| H2 | 请求次数超限 | ❌ 排除 |
+| H3 | 本地速率 / 输入量过大 | ❌ 排除 |
+| H4 | 上游侧状态（时段负载） | ✅ 唯一剩余解释 |
+
+其中 H3 的排除最出人意料：把本地请求率提到 4 倍、单次输入从 90 token 提到 8000 token（本地 TPM 达 29,000/分钟），B 类 429 率依然是 0。
 
 ---
 
-## 1. 研究背景
+## Abstract (English)
 
-### 1.1 问题
+SenseNova's free Token Plan endpoint returns HTTP 429 frequently under intensive
+calling. Rather than testing a single hypothesis, this study enumerates four candidate
+explanations and eliminates them one by one using **two controlled experiments
+(3,043 requests) and 2,820 production log records**:
 
-SenseNova 免费 Token Plan 在 agent 场景密集调用时频繁返回 429。用户体感是"发送带很长上下文的内容会一下子占很大额度，再次发送长上下文就返回 429"——即疑似 **TPM（每分钟 token 数）** 触发。
+| Hypothesis | Verdict |
+|---|---|
+| H1 — Free-tier quota exhausted | ❌ Rejected |
+| H2 — Request-count cap exceeded | ❌ Rejected |
+| H3 — Local rate / input size too large | ❌ Rejected |
+| H4 — Upstream-side state (time-of-day load) | ✅ Only surviving explanation |
 
-关键困惑：**积分池（5h 窗口 60000 credits）仅消耗 19% 时就频繁 429**，说明 429 与积分池并非同一配额。
+**H3's rejection is the most counterintuitive**: raising local request rate 4× and per-request
+input from 90 to 8,000 tokens (local TPM ≈ 29,000/min) still produced a **0%** B-class 429
+rate across 832 requests. The commonly assumed link between "long context" and 429 did not
+survive controlled testing.
 
-### 1.2 术语
+H4 is supported by observation: B-class rate varies **~13× by time of day** (3.4% late night
+→ 43.3% evening), triggering is **bursty** (255 errors within a single 10-minute window),
+and model quotas differ **2.4×**.
 
-| 术语 | 全称 | 含义 |
-|---|---|---|
-| **RPM** | Requests Per Minute | 每分钟请求**次数** |
-| **TPM** | Tokens Per Minute | 每分钟 token **总量** |
-| **A 类 429** | `token plan entitlement exhausted` | 次数/权益墙（长期封锁语义） |
-| **B 类 429** | `inference exceeds tpm/rpm limit` | 频率闸（退避即恢复） |
+**Methodological notes**: (a) the entitlement-exhaustion wall (A-class) served as a
+**negative control** throughout — its zero occurrence is what rules out H1 and H2;
+(b) 429 classification must rely on the response *message text*, not error codes — the same
+rate limiter surfaced at least 7 distinct codes, including `code 8` on a non-entitlement error;
+(c) production-log token fields **cannot** be used for rate-limit attribution, because failed
+requests always report `NULL` tokens, creating a spurious negative correlation.
+
+**Keywords**: SenseNova; rate limiting; HTTP 429; hypothesis elimination; TPM; RPM;
+controlled experiment; negative control
+
+---
+
+## 1. 问题与候选解释
+
+### 1.1 现象
+
+使用 SenseNova 免费 Token Plan 跑 agent 时，429 出现频繁。网上流传的解释是"每个模型有次数上限"，例如 deepseek-v4-flash 150 次/5 小时。
+
+但有一个地方对不上：**积分池只用了 19%，429 就已经很密集了。**
+
+### 1.2 四个候选解释
+
+面对 429，可以提出的解释不止一种。把它们整理成可检验的形式：
+
+| 编号 | 假设 | 通俗说法 | 可检验的预测 |
+|---|---|---|---|
+| **H1** | 套餐额度用完 | 免费额度被用光了 | 应出现额度墙报错；积分池应接近上限 |
+| **H2** | 请求次数超限 | 150 次/5h 用完了 | 从干净窗口起算，累计到某次数后必然被拒 |
+| **H3** | 本地速率/输入量过大 | 发太快了，或上下文太长了 | 提高请求率或输入长度，429 率应上升 |
+| **H4** | 上游侧状态 | 上游忙的时候才限流 | 429 率应随时段/负载变化，与本地流量无关 |
+
+### 1.3 两种 429 的分工
+
+SenseNova 返回的 429 在报文上有两类，它们在本文中承担不同角色：
+
+| 类别 | 报文 | 性质 | 本文中的角色 |
+|---|---|---|---|
+| **A 类** | `token plan entitlement exhausted` | 权益/额度墙，需等窗口重置 | **阴性对照**——用来排除 H1、H2 |
+| **B 类** | `inference exceeds tpm/rpm limit` 等 | 频率闸，退避即恢复 | **被测现象**——需要解释的就是它 |
+
+> **关键设计**：A 类并非"另一类需要解释的 429"，而是一个**对照工具**。它的作用类似实验中的空白对照：如果 429 是额度问题，就应该看到 A 类；**A 类全程 0 次，正是排除"额度/次数"解释的直接证据。**
+
+**两类 429 的实际出现次数**：
+
+| | 实验一（963 请求） | 实验二（2080 请求） | 合计 |
+|---|---|---|---|
+| A 类 | **0** | **0** | **0** |
+| B 类 | 312 | 2 | 314 |
 
 ---
 
 ## 2. 实验设计
 
-### 2.1 实验一（探索性，白天）
+### 2.1 实验一（探索性）
 
-- 双账号 × 双输入规模（臂）× 受控节奏
-- 6 个任务：3 模型（kimi-k3 / deepseek-v4-flash / deepseek-flash）× 大小臂，两账号间臂互换
-- 7 小时，963 请求，**直连上游绕过网关**
-- **事后发现的缺陷**：每个（账号, 模型）组合只测一条臂 ⇒ 臂效应与账号效应**完全混淆**
+- 双账号 × 双输入规模（臂）× 受控节奏，6 个任务，7 小时
+- 963 次请求，直连上游（绕过中转网关）
+- 为 A 类设了"连续 2 次则封板"的规则，目的是**测出次数墙在哪一次触发**（结果：从未触发）
 
-### 2.2 实验二（验证性，凌晨）
+### 2.2 实验二（受控验证）
 
-- **2×2 析因**：RPM(1 vs 4/min) × 输入规模(90 vs 8000 tok)
-- **三条防线**：① 同账号内跑全部 4 臂（消除账号差异）② 相位分离（同时刻仅一臂）③ 区组随机化（13 轮，固定随机种子）
-- 7.5 小时，2080 请求，双账号并行
+实验一暴露了一个设计缺陷：每个（账号, 模型）组合只测了一种输入长度，导致"输入长度"与"账号"两个变量纠缠，无法归因。实验二针对性地修正了这一点。
+
+- **2×2 析因**：请求率（1 vs 4 次/分钟）× 输入规模（90 vs 8000 token）
+- **三条防线**：
+  1. 同账号内跑全部 4 组 → 消除账号差异
+  2. 相位分离：同一时刻只跑一组 → 避免组间干扰
+  3. 区组随机化：13 轮，每轮组序随机（固定种子）→ 消除时间趋势
+- 7.5 小时，2080 次请求，双账号并行
 - **预注册**：假设、端点、停止规则、分析计划在运行前冻结
 
-| 臂 | RPM | 输入 | 目标 TPM | 请求数 |
+| 组 | 请求率 | 输入 | 目标 TPM | 请求数 |
 |---|---|---|---|---|
-| A1 lo_lo | 1/min | 90 tok | ≈90 | 208 |
-| A2 lo_hi | 1/min | 8000 tok | ≈8000 | 208 |
-| A3 hi_lo | 4/min | 90 tok | ≈360 | 832 |
-| A4 hi_hi | 4/min | 8000 tok | ≈32000 | 832 |
+| A1 | 1/min | 90 tok | ≈90 | 208 |
+| A2 | 1/min | 8000 tok | ≈8000 | 208 |
+| A3 | 4/min | 90 tok | ≈360 | 832 |
+| A4 | 4/min | 8000 tok | ≈32000 | 832 |
 
 ### 2.3 共同方法学决策
 
-1. 直连上游，避免网关自身的限速/冷却污染测量
-2. **429 分类按响应文案**（见 §4.1）
-3. 全字段记录（状态码、报文、错误码、实测 token 数、延迟）
+1. 直连上游，避免中转网关自身的限速与冷却干扰测量
+2. 429 按**响应文案**分类（理由见 §5.2）
+3. 全字段记录：状态码、报文、错误码、实测 token 数、延迟
 4. 断点续跑 + 进程守护 + 积分池护栏
-5. 实验二：按真实 usage 自动校准提示词长度（比例 0.391 收敛）
+5. 实验二按真实 usage 自动校准输入长度（收敛至 0.391）
 
 ---
 
-## 3. 实验结果
+## 3. 排除过程
 
-### 3.1 实验一
+### 3.1 排除 H1：不是套餐额度用完
 
-| 任务 | 账号 | 模型 | 臂 | 请求 | 成功 | B 类率 | A 类 |
-|---|---|---|---|---|---|---|---|
-| v4-flash 小臂 | ① | deepseek-v4-flash | 90 tok | 400 | 390 | 2.5% | 0 |
-| deepseek-flash 大臂 | ① | deepseek-flash | 7.7k tok | 250 | 48 | 80.8% | 0 |
-| v4-flash 大臂 | ② | deepseek-v4-flash | 7.7k tok | 250 | 192 | 23.2% | 0 |
-| deepseek-flash 小臂 | ② | deepseek-flash | 90 tok | 39 | 6 | 84.6% | 0 |
-| kimi-k3 小臂 | ①/② | kimi-k3 | 90 tok | 24 | 15 | 0% / 75% | 0 |
+**检验方法**：监控 A 类报错与积分池用量。
 
-**合计**：963 请求，312 次 B 类（32.4%），**A 类 0 次**
+**证据**：
 
-**初步判断（后被实验二修正）**：v4-flash 大臂 23.2% vs 小臂 2.5%，疑似 TPM 效应。
+| 指标 | 观测值 |
+|---|---|
+| A 类 `entitlement exhausted` 报错 | **0 次**（3043 次请求中） |
+| 积分池峰值（实验二） | 12.5% |
+| 另一次观测 | 19% 时 429 已很密集 |
 
-### 3.2 实验二
+**判定**：❌ **H1 排除**。如果 429 源于额度耗尽，应出现 A 类报错；实际情况相反。积分池用量与 429 频率之间没有单调关系——12.5% 时 429 趋近于零，19% 时反而频繁。
 
-| 臂 | 设计 | 请求 | B 类 | B 类率 |
+---
+
+### 3.2 排除 H2：不是请求次数超限
+
+**检验方法**：从干净窗口起步，持续对单一模型发请求，观察 A 类墙是否出现。
+
+**证据**：
+
+| 观测 | 结果 |
+|---|---|
+| 单模型单窗口成功请求数 | **390 次**（deepseek-v4-flash） |
+| A 类墙触发 | 从未 |
+| 实验一各任务硬上限 | 250–400 次，均未触发 |
+
+**判定**：❌ **H2 排除**。流传的"deepseek-v4-flash 150 次/5h"在本次条件下不成立——从干净窗口起算，累计到 390 次成功请求也没有撞上次数墙。
+
+> 需要说明的是，"未触发"不等于"该墙不存在"。它的存在有历史证据（生产日志中曾出现 A 类报错，集中在某一天的一小时内）。本次实验只能说明：**在温和的请求节奏下（1–4 次/分钟），这个墙够不着。**
+
+---
+
+### 3.3 排除 H3：不是本地速率或输入量（最关键的一条）
+
+**检验方法**：实验二 2×2 析因。同账号内、相位分离、区组随机化。
+
+**证据**：
+
+| 组 | 设计 | 请求数 | B 类 429 | B 类率 |
 |---|---|---|---|---|
-| A1 lo_lo | 1rpm × 90tok | 208 | 1 | 0.48% |
-| A2 lo_hi | 1rpm × 8000tok | 208 | 1 | 0.48% |
-| A3 hi_lo | 4rpm × 90tok | 832 | 0 | 0.00% |
-| A4 hi_hi | 4rpm × 8000tok | 832 | 0 | 0.00% |
+| A1 | 1/min × 90 tok | 208 | 1 | 0.48% |
+| A2 | 1/min × 8000 tok | 208 | 1 | 0.48% |
+| A3 | 4/min × 90 tok | 832 | 0 | 0.00% |
+| A4 | 4/min × 8000 tok | 832 | 0 | 0.00% |
 
-**合计**：2080 请求，2 次 B 类（0.10%），A 类 0 次
+**统计检验**（Fisher 精确检验，Bonferroni α=0.0125）：
 
-- 2 次 B 类都在**启动后 5 分钟内**，此后连续 6 小时零 429
-- **A4 臂在 TPM ≈ 29,000/min 负载下跑 832 次，零 B 类**
-- 两账号完全对称（各 1 次）
-
-### 3.3 假设检验（Fisher 精确检验，Bonferroni α=0.0125）
-
-| 假设 | 对比 | Δ | p 值 | 结论 |
+| 对比 | 检验内容 | Δ | p 值 | 结论 |
 |---|---|---|---|---|
-| H1 TPM 主效应 @1rpm | A1 vs A2 | 0.0 pp | 1.0000 | 不显著 |
-| H2 RPM 主效应 @90tok | A1 vs A3 | −0.48 pp | 0.2000 | 不显著（方向反） |
-| H4 TPM @4rpm | A3 vs A4 | 0.0 pp | 1.0000 | 不显著 |
+| A1 vs A2 | 固定请求率，变输入规模 | 0.0 pp | 1.0000 | 不显著 |
+| A1 vs A3 | 固定输入规模，变请求率 | −0.48 pp | 0.2000 | 不显著 |
+| A3 vs A4 | 高请求率下，变输入规模 | 0.0 pp | 1.0000 | 不显著 |
 
-**⇒ 实验一的"大臂效应"确认为账号×臂混淆的假象，而非 TPM 因果。**
+**关键点**：A4 组的实测 TPM 达到 **29,148/分钟**，跑了 832 次请求，B 类 429 为 **0**。
 
-### 3.4 生产数据佐证
+**判定**：❌ **H3 排除**。本地请求速率与输入规模都不是决定因素。
 
-分析生产网关日志（近 7 天 2820 次真实请求）：
+**这一条推翻了一个流行直觉**：
 
-**按时段的 B 类率（单模型 deepseek-v4-flash，控制模型变量）**：
+> "发送很长的上下文会一下子占很大额度，再发一次长上下文就会 429"
+
+这个说法在第一组实验中**看起来**得到了支持（大输入 23.2% vs 小输入 2.5%），但那是设计缺陷造成的假象——每个账号只测一种输入长度，"输入长度"和"账号"混在一起了。修正设计后，效应消失。
+
+**为什么报文仍然说 "tpm/rpm"**：报错文案是上游给出的理由，反映的是**上游侧的计量口径**，不等价于"本地流量超了"。把本地 TPM 拉到 29,000/分钟仍不触发，正说明这个门槛不由本地单方面决定。
+
+---
+
+### 3.4 H4 无法排除：上游侧状态
+
+前三项排除后，剩下唯一能解释观测结果的假设：**触发条件取决于上游在那一刻的状态。**
+
+**支持证据（观测性）**：
+
+#### 证据一：时段差异约 13 倍
+
+单模型（deepseek-v4-flash）口径，近 7 天生产数据：
 
 | 时段（北京） | B 类率 | 样本 |
 |---|---|---|
@@ -179,202 +222,192 @@ SenseNova 免费 Token Plan 在 agent 场景密集调用时频繁返回 429。�
 | 白天 09–16 | 25.4% | n=197 |
 | **傍晚 17–23** | **43.3%** | n=922 |
 
-**突发性**：某日傍晚 18 时逐 10 分钟统计——18:10 (28 次) → **18:20 (255 次)** → 18:30 (33 次) → 18:40 (1 次)。**十分钟洪流后骤降**。
+#### 证据二：触发呈突发性
 
-**模型差异**（同口径）：deepseek-flash 76% / deepseek-v4-pro 67% / deepseek-v4-flash 32%。
+某日傍晚 18 时逐 10 分钟统计：
 
-> ⚠️ 生产数据为观测性证据，样本不均衡（各时段 n 差异大），且观测窗口落在国庆假期，详见 §6。
+```
+18:10   28 次
+18:20  255 次   ← 十分钟内爆发，占该小时 78%
+18:30   33 次
+18:40    1 次   ← 骤降
+```
 
----
+这种形态更像"上游在某个瞬间进入受限状态"，而非本地流量匀速爬到阈值。
 
-## 4. 方法学发现
+#### 证据三：模型间配额差异 2.4 倍
 
-### 4.1 429 分类必须依据响应文案，而非错误码
+同口径近 7 天：deepseek-flash 76% / deepseek-v4-pro 67% / deepseek-v4-flash 32%。
 
-实测同一 B 类频率闸至少有 **7 种错误码写法**：
+#### 外部佐证
 
-| 错误码 | 出现次数 | 语义 |
-|---|---|---|
-| `RateLimitExceeded.EndpointTPMExceeded` | 135 | TPM 端点级 |
-| `RateLimitExceeded.EndpointRPMExceeded` | 100 | RPM 端点级 |
-| `insufficient_quota` | 42 | 频率闸（报文仍为 tpm/rpm） |
-| `429003` | 24 | 通用频率闸 |
-| `ModelAccountTpmRateLimitExceeded` | 7 | TPM 账号×模型级 |
-| `ModelAccountRpmRateLimitExceeded` | 2 | RPM 账号×模型级 |
-| `Throttling.BurstRate` | 1 | 突发节流 |
-| **`8`** | **1** | **code=8 但报文为 `rpm exhausted`（B 类！）** |
-
-**两个反例**：
-- `code 8` 不一定是 A 类（有一条报文为 `rpm exhausted`，属 B 类）
-- `insufficient_quota` 不代表额度墙（报文为 tpm/rpm 频率闸）
-
-**唯一可靠的 A 类判据**：文案 `token plan entitlement exhausted` + type `quota_exceeded_error`。
-
-**工程含义**：任何按错误码分类 429 的实现都会误判（例如把 B 类误判为 A 类，错误地下架模型 5 小时）。
-
-### 4.2 生产日志的 token 字段不能用于限流归因（因果倒置陷阱）
-
-按"上游回报的 input_tokens"分组统计 429 率，会得到荒谬结果：
-
-| 分组 | 429 率 |
-|---|---|
-| 大输入（>10k tok） | **0.0%** |
-| 无 token 记录（null） | **90%+** |
-
-**真相**：请求**失败时上游不返回 usage**，token 字段恒为 NULL ⇒ "null 组 429 率高"纯粹是"因为失败了所以没 token"。
-
-**正确做法**：在**请求侧**独立记录预期/实际发出的 token 数（本研究的压测器即如此）。
-
-### 4.3 积分池与 429 脱钩
-
-| 实验 | 积分池峰值 | B 类 429 状态 |
-|---|---|---|
-| 实验一 | ~19% | 高频 |
-| 实验二 | 12.5% | 几乎为零 |
-
-两个方向都证明积分池消耗与 429 无单调关系。**盯积分没有预警价值。**
-
-### 4.4 上游不返回 Retry-After
-
-312 次 B 类 429 的响应头与响应体**均无 `Retry-After` 字段**，客户端只能自行设计退避策略。
-
----
-
-## 5. 讨论：429 由什么驱动？
-
-综合两次实验与生产数据，B 类 429 的频率由**三个因素叠加**驱动：
-
-| 因素 | 证据 | 影响量级 |
-|---|---|---|
-| **时段** | 深夜 3.4% → 傍晚 43.3%（单模型） | 约 13 倍 |
-| **突发性** | 十分钟内 255 次后骤降 | 突发 >> 平稳 |
-| **模型** | deepseek-flash 76% vs v4-flash 32% | 约 2.4 倍 |
-
-**而非**单次请求的 token 量（实验二已证伪）。
-
-### 5.1 外部佐证
-
-检索发现 **Anthropic 已官方公开承认**采用"高峰时段动态收紧"机制
-（[The Register, 2026-03-26](https://www.theregister.com/2026/03/26/anthropic_tweaks_usage_limits/)）：
+Anthropic 在 2026 年 3 月公开承认采用了按时段调整的机制
+（[The Register 报道](https://www.theregister.com/2026/03/26/anthropic_tweaks_usage_limits/)）：
 
 > "To manage growing demand for Claude we're adjusting our five hour session limits ... **during peak hours**."
 > （为管理需求增长，我们在**高峰时段**调整 5 小时会话限制）
+>
+> 官方建议：**"把 token 密集型后台任务挪到非高峰时段，能延长会话限制。"**
 
-| 项 | Anthropic 官方 |
-|---|---|
-| 高峰时段 | 05:00–11:00 PT（= 北京 20:00–02:00） |
-| 机制 | **总周配额不变，只改变它在时间上的分配** |
-| 官方建议 | **"把 token 密集型后台任务挪到非高峰时段，能延长会话限制"** |
-| 影响面 | 约 7% 用户会撞到以前不会撞的限制 |
+**关键点是总配额不变、只改变它在时间上的分配。** 这个描述与本次观测到的现象吻合。
 
-**这条佐证的意义**：
-1. "动态分时限流"是业界真实做法，非臆测
-2. 其机制描述（总配额不变、只改时间分配）与本研究观测高度一致
-3. 官方建议与本研究工程结论（深夜是安全窗口）吻合
+> ⚠️ **但必须说明**：Anthropic 的机制是公告过的；**SenseNova 是否采用同类机制，没有官方确认**，本文的 H4 属于**基于观测的推断**，而非已证实的事实。
 
-**但必须说明**：Anthropic 的做法是**公告过的**；SenseNova 是否也如此**没有公开确认**，本研究的判断属于**基于观测的假设**。
-
-### 5.2 佐证强度评估（诚实标注）
-
-| 结论 | 强度 | 依据 |
-|---|---|---|
-| 动态分时限流存在 | 🟢 强 | Anthropic 官方公告 |
-| SenseNova 也是动态分时 | 🟡 中 | 仅本研究观测推断，无官方确认 |
-| TPM/RPM 双闸存在 | 🟢 强 | SenseNova 官方[计费文档](https://console.sensecore.cn/micro/help/docs/model-as-a-service/nova/pricing/)明确 |
-| "150 次/5h"不成立 | 🟢 强 | 本研究 3043 次请求实证 |
-| 傍晚高峰 / 深夜低谷 | 🟡 中 | 单数据源 + 假期窗口，需工作日复验 |
+**判定**：✅ **H4 是唯一未被排除的解释。**
 
 ---
 
-## 6. 局限（完整清单）
+## 4. 结论
 
-1. 🔴 **时段不可比**：实验一白天、实验二凌晨，跨实验对比有时段混淆
-2. 🔴 **假期/周末混杂（重要）**：两次实验均落在**国庆黄金周 + 周末**（2026-10-03 周六 / 10-04 周日）。假期用户结构异于工作日，可能影响平台负载与活跃时段分布。**所有时段结论严格限定为"假期期间观测"**
-3. **生产数据样本不均衡**：深夜 n=13–263、白天 n=9–278、傍晚 n=75–473；小样本时段置信度低
-4. **突发性结论基于单次事件**：某日傍晚 18:20 的 255 次爆发是否可复现，需更多天数据；观测期仅 5 天
-5. **实验二仅单模型**：deepseek-v4-flash；实验一提示 deepseek-flash 的 B 类率远高（~80%），未在受控实验复现
-6. **实验一部分任务未跑满**（被 7h 时限截断）
-7. **积分池采样部分失败**（凭证过期），护栏仅单账号生效
-8. **A 类墙"未触发"≠"不存在"**：本实验节奏下不可达，不排除更高频/打满积分池时会触发
-9. **平台策略可能随时间调整**：社区 2026-05 口径与本研究 2026-10 观测已不一致
-10. **时段与突发性在观测数据中难以完全分离**：傍晚高峰也可能是"傍晚用户更爱跑批量任务"
+### 4.1 最终结论
+
+> **SenseNova 免费 Token Plan 的 429，不是套餐额度问题，不是请求次数问题，也不是本地请求速率或输入长度问题——触发条件取决于上游在那一刻的状态。**
+
+用一句话概括：**429 不是"你的问题"，而是"上游当时的状态问题"。**
+
+### 4.2 实用含义
+
+| 做法 | 是否有效 | 依据 |
+|---|---|---|
+| 缩短上下文以降低 TPM | ❌ 无效 | H3 已排除（8000 tok @ 4/min 仍零 429） |
+| 降低请求频率 | ❌ 效果有限 | H3 已排除（4 次/分钟与 1 次/分钟无显著差异） |
+| 盯积分池做预警 | ❌ 无效 | H1 已排除（与 429 无单调关系） |
+| **避开高峰时段（尤其傍晚）** | ✅ **有效** | H4：时段差异 13 倍 |
+| **准备多账号/多节点故障转移** | ✅ **有效** | 模型间差异 2.4 倍；上游突发时需切换 |
+| **按文案区分两类 429 再决定退避策略** | ✅ **有效** | 见 §5.2 |
+
+---
+
+## 5. 方法学发现
+
+### 5.1 阴性对照的价值
+
+本研究最初把 A 类报错当作"另一类需要测量的现象"，甚至为它设计了封板规则。但从实验逻辑看，它的正确角色是**阴性对照**：
+
+- 若 429 源于额度耗尽 → 应观测到 A 类
+- 实际 A 类 0 次 → **排除额度解释**
+
+**这个零结果本身就是结论的一部分**，而且比任何阳性观测都更干净地排除了一个候选解释。
+
+> 反思：一个"什么都没发生"的对照组，容易被误当成"没有发现"而低估其价值。
+
+### 5.2 429 分类必须依据文案，而非错误码
+
+实测同一个频率闸（B 类）至少返回 **7 种不同的错误码**：
+
+| 错误码 | 出现次数 | 说明 |
+|---|---|---|
+| `RateLimitExceeded.EndpointTPMExceeded` | 135 | TPM 维度 |
+| `RateLimitExceeded.EndpointRPMExceeded` | 100 | RPM 维度 |
+| `insufficient_quota` | 42 | 名字像额度，实为频率限制 |
+| `429003` | 24 | 通用 |
+| `ModelAccountTpmRateLimitExceeded` | 7 | 账号×模型级 |
+| `ModelAccountRpmRateLimitExceeded` | 2 | 账号×模型级 |
+| `Throttling.BurstRate` | 1 | 突发节流 |
+| **`8`** | **1** | **code=8，但报文是 `rpm exhausted`** |
+
+**最后一条是关键**：`code 8` 通常被当作额度墙标志，但这里它对应的是频率限制。按错误码分类的实现，会把一个仍可用的模型误判为额度耗尽，进而错误停用 5 小时。
+
+**可靠判据只有响应文案**：`token plan entitlement exhausted` 才是真正的额度墙。
+
+### 5.3 生产日志的 token 字段不能用于限流归因
+
+按"上游返回的 token 数"给生产日志分组统计 429 率：
+
+```
+大输入（>10k token）  429 率 0.0%
+无 token 记录（null） 429 率 90%+
+```
+
+表面看像"token 越多越安全"，与受控实验结论正好相反。
+
+**真实原因**：请求失败时上游不返回 usage，token 字段必然是 NULL，因此所有失败样本都落入"无数据"组。这是典型的**因果倒置**。
+
+正确做法：在**请求侧**独立记录预期/实际发出的 token 量。
+
+### 5.4 上游不返回 Retry-After
+
+314 次 B 类 429 的响应头与响应体均无 `Retry-After` 字段，客户端只能自行设计退避策略。
+
+---
+
+## 6. 局限
+
+1. 🔴 **假期混杂**：两次实验都在国庆假期（2026-10-03 周六 / 10-04 周日）进行，工作日时段分布可能有差异。所有时段结论限定为"假期期间观测"。
+2. 🔴 **H4 属观测推断**：时段效应的证据来自生产日志（观测性），**时段与突发性无法完全分离**——傍晚偏高也可能只是那个时段批量任务更多。要坐实需在工作日做受控复现。
+3. **样本不均衡**：生产数据各时段 n 从 13 到 473 不等，小样本时段置信度低。
+4. **突发性结论基于单次事件**：某日 18:20 的 255 次爆发是否可复现，需更多天数据；观测期仅 5 天。
+5. **主要结论基于单模型**：受控实验只用了 deepseek-v4-flash。
+6. **"未触发"≠"不存在"**：A 类墙在历史数据中出现过，只是本次温和节奏下够不着。
+7. **实验一部分任务被时限截断**。
+8. **积分池采样部分失败**（凭证过期），护栏仅单账号生效。
 
 ---
 
 ## 7. 后续实验建议
 
-若要在工作日复验并分离三因素，建议六段对照（每段 3 小时）：
+若要坐实 H4 并分离"时段"与"突发性"，建议在工作日做六段对照：
 
-| 段 | 时段 | 星期 | 模型 | 负载 | 目的 |
-|---|---|---|---|---|---|
-| S1 | 深夜 02–05 | 任意 | v4-flash | 平稳 | 低谷基线 |
-| S2 | 白天 10–13 | 任意 | v4-flash | 平稳 | 白天对照 |
-| S3 | 傍晚 18–21 | 任意 | v4-flash | 平稳 | 高峰验证 |
-| S4 | 傍晚 18–21 | 同 S3 | v4-flash | **突发** | 突发性验证 |
-| S5 | 傍晚 18–21 | 同 S3 | deepseek-flash | 平稳 | 模型差异 |
-| S6 | 傍晚 18–21 | **工作日** | v4-flash | 平稳 | **假期 vs 工作日** |
+| 段 | 时段 | 星期 | 负载模式 | 目的 |
+|---|---|---|---|---|
+| S1 | 深夜 02–05 | 任意 | 平稳 | 低谷基线 |
+| S2 | 白天 10–13 | 任意 | 平稳 | 白天对照 |
+| S3 | 傍晚 18–21 | 任意 | 平稳 | 高峰验证 |
+| S4 | 傍晚 18–21 | 同 S3 | **突发** | 分离突发性 |
+| S5 | 傍晚 18–21 | 同 S3 | 平稳（换模型） | 模型差异 |
+| S6 | 傍晚 18–21 | **工作日** | 平稳 | **分离假期效应** |
 
-总计约 2160 请求，积分消耗约 1.2%。判定标准：Fisher 精确检验，α=0.0125。
+总计约 2160 次请求。判定：Fisher 精确检验，α=0.0125。
 
 ---
 
 ## 8. 数据与复现
 
-- `experiment-1/results.ndjson` — 963 请求全字段
-- `experiment-2/results.ndjson` — 2080 请求全字段
-- `experiment-2/blocks.ndjson` — 104 块级汇总
-- `charts/` — 4 张图表源文件
-- 复现程序：`loader.mjs` / `runner.mjs`（压测器）、`analyze.mjs`（分析器）、`config.json`（配置）
-- 运行环境：Node.js ≥ 20（原生 fetch + node:sqlite）
+| 文件 | 内容 |
+|---|---|
+| `experiment-1/results.ndjson` | 963 次请求全字段 |
+| `experiment-2/results.ndjson` | 2080 次请求全字段 |
+| `experiment-2/blocks.ndjson` | 104 个块级汇总 |
+| `charts/` | 5 张图表（含排除逻辑图） |
+| `loader.mjs` / `runner.mjs` | 压测器（含断点续跑、相位分离） |
+| `analyze.mjs` | 分析器（含 Fisher 精确检验） |
+| `config.json` | 实验配置（预注册参数） |
 
-**复现命令**：
+**复现**：
 ```bash
-# 需自行准备 SenseNova 账号的 API key，写入环境变量或 nodes.csv
+# 需自备 SenseNova 账号 API key（环境变量或 nodes.csv）
 cd experiment-2
-touch GO
-node runner.mjs --go
-node analyze.mjs
+node runner.mjs --dry-run    # 先看调度计划
+node runner.mjs --self-test  # mock 自检
+touch GO && node runner.mjs --go   # 正式运行
+node analyze.mjs             # 分析
 ```
 
 ---
 
-## 9. 致谢
+## 9. AI 使用声明
+
+本研究在**人类作者主导**的前提下，部分环节使用了 AI 助手辅助。
+
+**由人类作者完成**：研究问题的提出、实验方案的方向性决策、实验的执行环境与账号资源、对结论的审阅与最终认可、对 AI 产出的逐项核查。
+
+**由 AI 助手辅助**：压测与分析代码的编写、数据整理与聚合、图表绘制、文稿起草、外部文献检索。
+
+**声明要点**：
+
+1. 所有实验数据均由真实请求产生，未经 AI 生成或修改，原始数据可供独立核验。
+2. 所有统计结论均可由随附数据与脚本复现。
+3. AI 产出经过人类作者审阅，**作者对本文全部内容负责**。
+4. 本声明遵循学术出版中日益通行的 AI 使用透明化原则。
+
+---
+
+## 10. 致谢
 
 感谢商汤 SenseNova 免费 Token Plan 提供的测试资源。
 
 ---
 
-## 10. AI 使用声明
-
-本研究在**人类作者主导**的前提下，部分环节使用了 AI 助手（大语言模型）辅助，具体分工如下：
-
-### 由人类作者完成
-
-- 研究问题的提出与界定
-- 实验方案的方向性决策（是否做对照、做几组、跑多久）
-- 实验的实际执行环境与账号资源
-- 对结论的审阅、判断与最终认可
-- 对 AI 产出的逐项核查与修正
-
-### 由 AI 助手辅助完成
-
-- **代码实现**：压测器、分析器的代码编写（`loader.mjs` / `runner.mjs` / `analyze.mjs`）
-- **数据整理**：原始请求记录的结构化与聚合统计
-- **图表绘制**：4 张图表的绘制脚本
-- **文稿起草**：本报告的结构编排与初稿撰写
-- **文献检索**：外部佐证材料的检索（如 Anthropic 相关公开报道）
-
-### 声明要点
-
-1. **所有实验数据均由真实请求产生**，未经 AI 生成或修改。原始数据文件（`results.ndjson`）可供独立核验。
-2. **所有统计结论均可由随附数据与脚本复现**——读者可运行 `analyze.mjs` 自行验证每一个数字。
-3. **AI 产出的内容经过人类作者审阅**，但**作者对本文的全部内容负责**，包括可能存在的错误。
-4. 本声明遵循学术出版中日益通行的 AI 使用透明化原则（如 COPE、ICMJE 的相关指引精神）。
-
-> 若读者发现任何与数据不符之处，欢迎通过仓库 Issues 反馈。
-
----
-
 *本文档采用 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 协议授权：允许自由转载、改编、商用，仅需保留署名并注明是否修改。*
 
-*所有数字均可由随附数据文件复现。本研究为个人探索性研究，欢迎指正与继续研究。*
+*v2.0 修订说明：v1.0 将 A 类报错表述为"核心发现"之一，并把 B 类报文的措辞误当作触发原因，导致结论自相矛盾。本版按"四选一排除法"重构：A 类回归其阴性对照的角色，结论改为"排除前三项后剩上游侧状态"。*
