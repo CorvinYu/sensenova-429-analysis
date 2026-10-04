@@ -1,0 +1,86 @@
+{
+  "_title": "实验二：sensenova 429 的 TPM 与 RPM 维度分离（2×2 析因设计）",
+  "_purpose": "修正实验一的账号×臂混淆缺陷：在【同一账号、同一模型】内，用【时间交错的区组】构造 2×2 析因对照，分离『请求率(RPM)』与『token 率(TPM)』对 B 类 429 的独立效应与交互作用。",
+  "_preregistered": true,
+  "_frozen": "2026-10-03（运行前冻结，运行中不得修改）",
+
+  "base_url": "https://token.sensenova.cn/v1",
+  "model": "deepseek-v4-flash",
+  "accounts": ["sensenova-1", "sensenova-2"],
+  "_parallel_accounts_note": "两账号配额独立，并行执行以在 6h 内完成更多轮次；每账号内部严格串行（同一时刻仅一条臂在跑）。",
+
+  "max_tokens": 16,
+  "request_timeout_ms": 120000,
+  "net_retry": 2,
+  "net_retry_backoff_ms": 3000,
+
+  "cycles": 13,
+  "inter_block_gap_ms": 20000,
+  "global_deadline_hours": 7.5,
+  "random_seed": 20261003,
+
+  "b429_backoff_ms": 0,
+  "_b429_backoff_note": "0 = 收到 429 不退避。自变量是『尝试速率』，429 是结果变量；若退避会把速率变成内生变量。",
+
+  "pool_poll_interval_ms": 1800000,
+  "pool_stop_pct": 0.85,
+  "pool_degrade_pct": 0.60,
+
+  "prompt_calibration_init": 0.39,
+  "_calibration_note": "实验一实测：估算器 19942 ↔ 真实 7738 ⇒ 比例 0.39。运行器会在每臂首次拿到 usage 后自动重校准（按真实 token 反推重复次数）。",
+
+  "prompts": {
+    "small": "请只回答两个字：好的。",
+    "seed": "这是一段用于限流压测的重复文本。商汤大装置平台的令牌计划按模型与账号计量，输入令牌数会影响触发阈值。本段落将被重复拼接以构造大输入，内容本身无业务含义。"
+  },
+
+  "_factorial": {
+    "factorA": "RPM（请求率）：low = 1/min，high = 4/min",
+    "factorB": "输入规模：small ≈ 90 tok，large ≈ 8000 tok",
+    "cells": {
+      "lo_lo": "1 rpm × 90 tok ≈ 90 tpm",
+      "lo_hi": "1 rpm × 8000 tok ≈ 8000 tpm",
+      "hi_lo": "4 rpm × 90 tok ≈ 360 tpm",
+      "hi_hi": "4 rpm × 8000 tok ≈ 32000 tpm"
+    }
+  },
+
+  "arms": [
+    { "id": "lo_lo", "name": "A1", "rpm": "low",  "size": "small", "intervalMs": 60000, "requestsPerBlock": 8,  "targetTokens": 90,   "promptKind": "small", "note": "低 RPM × 小输入（基线，预期 ~0%）" },
+    { "id": "lo_hi", "name": "A2", "rpm": "low",  "size": "large", "intervalMs": 60000, "requestsPerBlock": 8,  "targetTokens": 8000, "promptKind": "seed",  "note": "低 RPM × 大输入（固定 RPM，抬 TPM 88×）" },
+    { "id": "hi_lo", "name": "A3", "rpm": "high", "size": "small", "intervalMs": 15000, "requestsPerBlock": 32, "targetTokens": 90,   "promptKind": "small", "note": "高 RPM × 小输入（固定小尺寸，抬 RPM 4×）" },
+    { "id": "hi_hi", "name": "A4", "rpm": "high", "size": "large", "intervalMs": 15000, "requestsPerBlock": 32, "targetTokens": 8000, "promptKind": "seed",  "note": "高 RPM × 大输入（双高，预期最高 B 类率）" }
+  ],
+
+  "_planned_contrasts": {
+    "TPM_main_effect": "A1 vs A2（RPM 固定 1/min，只变输入规模 90→8000）",
+    "RPM_main_effect": "A1 vs A3（输入规模固定 90 tok，只变 RPM 1→4）",
+    "TPM_at_high_RPM": "A3 vs A4（RPM 固定 4/min，只变输入规模）",
+    "RPM_at_large_size": "A2 vs A4（输入规模固定 8000 tok，只变 RPM）",
+    "interaction": "(A4−A3) vs (A2−A1)"
+  },
+
+  "primary_endpoint": "各臂 B 类 429 率 = B 类 429 次数 / 尝试次数（按账号与臂聚合）",
+  "secondary_endpoints": [
+    "A 类 entitlement 是否出现（首次出现序号/时刻）——实验一 0 次，再证",
+    "实现速率（realized RPM / TPM，由真实时间戳与真实 usage 计算）",
+    "块内位置效应（前 2 次请求 vs 后续）",
+    "429 与 200 的延迟分布",
+    "积分池轨迹（含窗口重置时刻）"
+  ],
+
+  "stop_rules": {
+    "deadline": "到达 global_deadline_hours 停止启动新块（当前块跑完）",
+    "pool": "任一账号池用量 ≥ pool_stop_pct 时停止启动新块",
+    "a_class": "出现 A 类 entitlement 时记录并继续（不停止）——A 类是需要观察的稀缺事件",
+    "fatal_net": "连续 20 次网络层失败（status=0）时中止并告警"
+  },
+
+  "expected": {
+    "blocks_per_account": 44,
+    "requests_per_account": 880,
+    "total_requests": 1760,
+    "wall_clock_hours": "≈5.8h（含块间 gap；账号并行）",
+    "tokens_per_account": "≈1.4M（积分 ≈1400 credit，占 5h 池 2.3%）"
+  }
+}
